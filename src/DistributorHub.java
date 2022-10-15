@@ -7,6 +7,7 @@ import java.util.*;
 
 public class DistributorHub extends Thread {
     protected static DatagramSocket socket;
+    boolean running = true;
     private static final Vector<ConnectedConfig> currentConnections = new Vector<>();
     private final LinkedHashMap<String, LinkedHashMap<Long, String>> channelHistory = new LinkedHashMap<>();
 
@@ -16,18 +17,32 @@ public class DistributorHub extends Thread {
 
     public DistributorHub(int port) throws SocketException{
         socket = new DatagramSocket(port);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            for (ConnectedConfig config : currentConnections){
+                try {
+                    config.sendMessage("%END:");
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }));
     }
 
+    public void endServer(){
+        running = false;
+    }
+
+    public boolean isRunning() {
+        return running;
+    }
 
     public void run() {
-        boolean running = true;
 
         channelHistory.put("1", new LinkedHashMap<>());
-
+        System.out.println("[SERVER] SERVER PLATFORM STARTED");
         while (running) {
             byte[] buf = new byte[256];
             DatagramPacket packet = new DatagramPacket(buf, buf.length);
-
             try {
                 socket.receive(packet);
             } catch (IOException e) {
@@ -53,7 +68,7 @@ public class DistributorHub extends Thread {
             There should never be a space inbetween a command and an arg
              */
             char[] command = new char[5];
-            received.getChars(0, 4, command, 0);
+            received.getChars(0, 5, command, 0);
             //Start read
             if (command[0] != '%') continue;
             if (command[4] != ':') continue;
@@ -100,14 +115,10 @@ public class DistributorHub extends Thread {
                     //we know who sent it and have their config. Now we need to broadcast it out to all other peers
                     String payload = getPayload(received);
 
-                    //Obtain the time
-                    String S = getTime();
-                    String outputMessage = "["+S+"]["+config.getScreenName()+"]: " + payload;
-
-                    logMessageToChannel(outputMessage, config.getChannel());
+                    logMessageToChannel(payload, config.getChannel());
                     config.checkIn();
                     try {
-                        distributeMessageToChannel(outputMessage, config.getChannel());
+                        distributeMessageToChannel(payload, config.getChannel(), config.getScreenName());
                     } catch (IOException ignored) {
                         System.out.println("[SERVER] COULD NOT BROADCAST MSG TO CHANNEL " + config.getChannel());
                     }
@@ -116,11 +127,16 @@ public class DistributorHub extends Thread {
                     if (getConnectionViaPort(currentPort) == null) {
                         try {
                             ConnectedConfig connectedConfig = new ConnectedConfig(currentAddress, currentPort);
-                            connectedConfig.sendMessage("%YES:");
-                            currentConnections.add(connectedConfig);
+                            connectedConfig.sendMessage("%YES:id=" + connectedConfig.getUniqueIdentifier());
+                            String name = getValueAfterCommand(received);
+                            if (name == null || name.equals("SERVER")) name = "ANON-" + connectedConfig.getUniqueIdentifier();
                             connectedConfig.checkIn();
+                            connectedConfig.setChannel("1");
+                            connectedConfig.setScreenName(name);
+                            currentConnections.add(connectedConfig);
+                            distributeMessageToChannel(connectedConfig.getScreenName()+ " has joined this channel (" + connectedConfig.getChannel() + ")", connectedConfig.getChannel(), "SERVER");
                         } catch (IOException ignored) {
-
+                            System.out.println("[SERVER] COULD NOT CONNECT USER TO CHANNEL");
                         }
                     }
                 }
@@ -152,6 +168,7 @@ public class DistributorHub extends Thread {
                         currentConnections.remove(config);
                         try {
                             config.sendMessage("%END:");
+                            distributeMessageToChannel(config.getScreenName()+ " has disconnected", config.getChannel(),"SERVER");
                         } catch (IOException e) {
                             System.out.println("[SERVER] COULD NOT SEND END TO CLIENT " + config.getScreenName() + " ON UUID " + config.getUniqueIdentifier());
                         }
@@ -198,18 +215,41 @@ public class DistributorHub extends Thread {
                             continue;
                         }
                     }
-                    //change channel
-                    String prevChannel = config.getChannel();
-                    config.setChannel(getPayload(received));
-                    try {
-                        config.sendMessage("%YES:");
-                    } catch (IOException ignored) {
-                        System.out.println("[SERVER] COULD NOT SEND YES TO CLIENT " + config.getScreenName() + " ON UUID " + config.getUniqueIdentifier());
-                    }
-                    try {
-                        distributeMessageToChannel("["+getTime()+"][SERVER]: " + config.getScreenName() + " has left the channel", prevChannel);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+                    //determine kind of set
+                    String payload = getPayload(received);
+                    String type = getPayloadCommand(payload);
+                    switch (type){
+                        //Change channel
+                        case "ch" -> {
+                            String prevChannel = config.getChannel();
+                            String channel = getPayloadNotCommand(received);
+                            config.setChannel(channel);
+                            try {
+                                config.sendMessage("%YES:Channel changed to \"" + channel + "\"" );
+                            } catch (IOException ignored) {
+                                System.out.println("[SERVER] COULD NOT SEND YES TO CLIENT " + config.getScreenName() + " ON UUID " + config.getUniqueIdentifier());
+                            }
+                            try {
+                                distributeMessageToChannel(config.getScreenName() + " has left the channel", prevChannel, "SERVER");
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                        case "nm" -> {
+                            String prevname = config.getScreenName();
+                            String name = getPayloadNotCommand(received);
+                            config.setScreenName(name);
+                            try {
+                                config.sendMessage("%YES:Name changed to \"" + name + "\"" );
+                            } catch (IOException ignored) {
+                                System.out.println("[SERVER] COULD NOT SEND YES TO CLIENT " + config.getScreenName() + " ON UUID " + config.getUniqueIdentifier());
+                            }
+                            try {
+                                distributeMessageToChannel(prevname + " has changed their name to " + name, config.getChannel(),"SERVER");
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
                     }
                 }
                 /*case "REQ" -> {
@@ -252,12 +292,14 @@ public class DistributorHub extends Thread {
                     }
                     //Keepalive
                     config.checkIn();
+                    try {
+                        config.sendMessage("%YES:");
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
                 }
+                default -> System.out.println("[SERVER] COMMAND NOT RECOGNIZED: "+received);
             }
-
-
-
-
         }
         socket.close();
     }
@@ -289,16 +331,16 @@ public class DistributorHub extends Thread {
 
     protected static boolean checkForDuplicateIDs(String uid){
         for (ConnectedConfig connectedConfig : currentConnections) {
-            if (connectedConfig.getUniqueIdentifier().equals(uid)) return false;
+            if (connectedConfig.getUniqueIdentifier().equals(uid)) return true;
         }
-        return true;
+        return false;
     }
 
-    private void distributeMessageToChannel(String message, String channel) throws IOException {
+    private void distributeMessageToChannel(String message, String channel, String senderScreenName) throws IOException {
         for (ConnectedConfig connectedConfig : currentConnections){
             if (connectedConfig.getChannel().equals(channel)){
                 try {
-                    connectedConfig.sendMessage(message);
+                    connectedConfig.sendMessage("%MSG:[" + getTime() + "][" + senderScreenName + "]: " + message);
                 } catch (Exception ignored) {}
             }
         }
@@ -317,38 +359,37 @@ public class DistributorHub extends Thread {
         return null;
     }
 
-    private String readID(String input){
+    public static String readID(String input){
         char[] pattern = {':', 'i', 'd', '='};
         char[] buffer = input.toCharArray();
+        if (buffer.length < 14) return null;
         byte i = 4;
         for (char c : pattern){
             if (buffer[i] != c) return null;
             i++;
         }
         StringBuilder out = new StringBuilder();
-        for (; i <= 14; i++){
+        for (; i <= 13; i++){
             out.append(buffer[i]);
         }
         return out.toString();
     }
 
-    private String readName(String input){
-        char[] pattern = {':', 'n', 'm', '='};
-        char[] buffer = input.toCharArray();
-        byte i = 4;
-        for (char c : pattern){
-            if (buffer[i] != c) return null;
-            i++;
-        }
-        StringBuilder out = new StringBuilder();
-        for (; i <= input.length() - 1; i++){
-            out.append(buffer[i]);
-        }
-        return out.toString();
+    public static String getValueAfterCommand(String input){
+        if (input.length() <= 5) return null;
+        return String.copyValueOf(input.toCharArray(), 5, input.length()-5);
     }
 
-    private String getPayload(String input){
-        return String.valueOf(Arrays.copyOfRange(input.toCharArray(), 15, input.length()-1));
+    public static String getPayloadCommand(String input){
+        return String.copyValueOf(input.toCharArray(), 0, 2);
+    }
+
+    public static String getPayload(String input){
+        return String.valueOf(Arrays.copyOfRange(input.toCharArray(), 14, input.length()));
+    }
+
+    public static String getPayloadNotCommand(String input){
+        return String.valueOf(Arrays.copyOfRange(input.toCharArray(), 16, input.length()));
     }
 
 }

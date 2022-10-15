@@ -25,7 +25,6 @@ public class ConnectedConfig {
         //The server will send the client a setup packet and assume the client will know to use the same port every time
         //This sets the UUID of the client, for the client
         this.channel = "1";
-        sendMessage("%SET:id=" + this.uniqueIdentifier + "1");
     }
 
 
